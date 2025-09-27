@@ -19,7 +19,8 @@ A new year brings some much requested feature updates to one of our most popular
 9. [Extensions](./docs/7-extensions.md)
 10. [Environment variables](./docs/8-environment-variables.md)
 11. [Managed Identity-based deployment](./docs/9-managed-identities.md)
-12. [Migration considerations](./docs/migration.md)
+12. [Datadog Monitoring Integration](./docs/10-datadog-monitoring.md)
+13. [Migration considerations](./docs/migration.md)
 
 # Introduction
 

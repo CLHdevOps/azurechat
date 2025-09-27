@@ -1,0 +1,630 @@
+# Azure DevOps CI/CD Pipeline for Azure Chat Application
+# Enterprise-grade pipeline with security, quality gates, and multi-environment deployment
+
+name: '$(Date:yyyyMMdd)$(Rev:.r)'
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+      - '*.md'
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - README.md
+      - docs/**
+      - '*.md'
+
+variables:
+  # Build Configuration
+  - name: nodeVersion
+    value: '20.x'
+  - name: buildConfiguration
+    value: 'production'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+  
+  # Application Settings
+  - name: workingDirectory
+    value: 'src'
+  - name: artifactName
+    value: 'azurechat-app'
+  
+  # Infrastructure Settings
+  - name: infraDirectory
+    value: 'infra'
+  - name: azureServiceConnectionDev
+    value: 'azure-connection-dev'  # Replace with your service connection name
+  - name: azureServiceConnectionProd
+    value: 'azure-connection-prod'  # Replace with your service connection name
+  
+  # Security and Quality
+  - name: sonarProjectKey
+    value: 'azurechat'
+  - name: enableSecurityScanning
+    value: 'true'
+
+# Pipeline Stages
+stages:
+# ==================================================
+# CONTINUOUS INTEGRATION STAGE
+# ==================================================
+- stage: CI
+  displayName: 'Continuous Integration'
+  variables:
+    - group: 'azurechat-shared'  # Create this variable group for shared secrets
+  jobs:
+  
+  # Code Quality and Security Analysis
+  - job: CodeAnalysis
+    displayName: 'Code Quality & Security Analysis'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      displayName: 'Install Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: $(nodeVersion)
+    
+    - task: Cache@2
+      displayName: 'Cache npm packages'
+      inputs:
+        key: 'npm | "$(Agent.OS)" | $(workingDirectory)/package-lock.json'
+        restoreKeys: |
+          npm | "$(Agent.OS)"
+        path: $(workingDirectory)/node_modules
+    
+    - script: |
+        cd $(workingDirectory)
+        npm ci
+      displayName: 'Install dependencies'
+    
+    - script: |
+        cd $(workingDirectory)
+        npm run lint
+      displayName: 'Run ESLint'
+      continueOnError: 'true'
+    
+    # TypeScript compilation check
+    - script: |
+        cd $(workingDirectory)
+        npx tsc --noEmit
+      displayName: 'TypeScript compilation check'
+    
+    # Security vulnerability scanning
+    - script: |
+        cd $(workingDirectory)
+        npm audit --audit-level high
+      displayName: 'NPM security audit'
+      continueOnError: 'true'
+    
+    # Manual security scanning using PowerShell
+    - task: PowerShell@2
+      displayName: 'Security dependency check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Running security dependency analysis..."
+          cd $(workingDirectory)
+          
+          # Check for known vulnerabilities in package-lock.json
+          $packageLock = Get-Content "package-lock.json" -Raw | ConvertFrom-Json
+          Write-Host "Checking $(($packageLock.packages | Get-Member -Type NoteProperty | Measure-Object).Count) packages for vulnerabilities"
+          
+          # Run npm audit and capture results
+          $auditResult = npm audit --json 2>$null
+          if ($auditResult) {
+            $audit = $auditResult | ConvertFrom-Json
+            if ($audit.vulnerabilities -and ($audit.vulnerabilities | Get-Member -Type NoteProperty).Count -gt 0) {
+              Write-Warning "Security vulnerabilities found. Review npm audit output."
+            } else {
+              Write-Host "✅ No high-severity vulnerabilities detected"
+            }
+          }
+        continueOnError: 'true'
+
+  # Build and Test
+  - job: BuildAndTest
+    displayName: 'Build and Test Application'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: NodeTool@0
+      displayName: 'Install Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: $(nodeVersion)
+    
+    - task: Cache@2
+      displayName: 'Cache npm packages'
+      inputs:
+        key: 'npm | "$(Agent.OS)" | $(workingDirectory)/package-lock.json'
+        restoreKeys: |
+          npm | "$(Agent.OS)"
+        path: $(workingDirectory)/node_modules
+    
+    - script: |
+        cd $(workingDirectory)
+        npm ci
+      displayName: 'Install dependencies'
+    
+    # Run tests (when available)
+    - script: |
+        cd $(workingDirectory)
+        if [ -f "jest.config.js" ] || grep -q "\"test\":" package.json; then
+          npm test -- --coverage --watchAll=false
+        else
+          echo "No tests configured, skipping test execution"
+        fi
+      displayName: 'Run tests'
+      continueOnError: 'true'
+    
+    # Build application
+    - script: |
+        cd $(workingDirectory)
+        npm run build
+      displayName: 'Build application'
+      env:
+        NODE_ENV: production
+    
+    # Create deployment artifact
+    - task: ArchiveFiles@2
+      displayName: 'Archive application files'
+      inputs:
+        rootFolderOrFile: '$(workingDirectory)'
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/$(artifactName)-$(Build.BuildId).zip
+        replaceExistingArchive: true
+        verbose: true
+    
+    # Publish build artifacts
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish build artifacts'
+      inputs:
+        targetPath: $(Build.ArtifactStagingDirectory)
+        artifactName: $(artifactName)
+        publishLocation: 'pipeline'
+
+  # Infrastructure Validation
+  - job: InfrastructureValidation
+    displayName: 'Infrastructure Validation'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Validate Bicep templates'
+      inputs:
+        azureSubscription: $(azureServiceConnectionDev)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          # Install bicep
+          az bicep install
+          
+          # Validate main bicep template
+          echo "Validating Bicep templates..."
+          az bicep build --file $(infraDirectory)/main.bicep
+          az bicep build --file $(infraDirectory)/resources.bicep
+          
+          # Lint bicep files
+          az bicep lint --file $(infraDirectory)/main.bicep
+          az bicep lint --file $(infraDirectory)/resources.bicep
+          
+          echo "Bicep validation completed successfully"
+    
+    # Publish infrastructure artifacts
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish infrastructure artifacts'
+      inputs:
+        targetPath: $(infraDirectory)
+        artifactName: infrastructure
+        publishLocation: 'pipeline'
+
+# ==================================================
+# DEVELOPMENT DEPLOYMENT STAGE
+# ==================================================
+- stage: DeployDev
+  displayName: 'Deploy to Development'
+  dependsOn: CI
+  condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.SourceBranch'], 'refs/heads/main')))
+  variables:
+    - group: 'azurechat-dev'  # Create this variable group for dev environment
+    - name: environmentName
+      value: 'dev'
+    - name: resourceGroupName
+      value: 'rg-azurechat-dev'
+  jobs:
+  
+  # Infrastructure Deployment
+  - deployment: InfrastructureDev
+    displayName: 'Deploy Infrastructure - Dev'
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'azurechat-dev'  # Create this environment in Azure DevOps
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download infrastructure artifacts'
+            inputs:
+              artifact: infrastructure
+              path: '$(Pipeline.Workspace)/infrastructure'
+          
+          - task: AzureCLI@2
+            displayName: 'Deploy Azure infrastructure'
+            inputs:
+              azureSubscription: $(azureServiceConnectionDev)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Deploying infrastructure to Development environment..."
+                
+                # Set variables
+                DEPLOYMENT_NAME="azurechat-infra-$(Build.BuildId)"
+                
+                # Deploy main bicep template
+                az deployment sub create \
+                  --name "$DEPLOYMENT_NAME" \
+                  --location "$(AZURE_LOCATION)" \
+                  --template-file "$(Pipeline.Workspace)/infrastructure/main.bicep" \
+                  --parameters \
+                    name="$(ENVIRONMENT_NAME)" \
+                    location="$(AZURE_LOCATION)" \
+                    openAILocation="$(OPENAI_LOCATION)" \
+                    dalleLocation="$(DALLE_LOCATION)" \
+                    disableLocalAuth=true \
+                    usePrivateEndpoints=false \
+                    resourceGroupName="$RESOURCE_GROUP_NAME"
+                
+                # Capture outputs
+                echo "Capturing deployment outputs..."
+                az deployment sub show \
+                  --name "$DEPLOYMENT_NAME" \
+                  --query "properties.outputs" \
+                  --output json > deployment-outputs.json
+                
+                cat deployment-outputs.json
+            name: deployInfra
+            env:
+              ENVIRONMENT_NAME: $(environmentName)
+              RESOURCE_GROUP_NAME: $(resourceGroupName)
+              AZURE_LOCATION: $(AZURE_LOCATION)
+              OPENAI_LOCATION: $(OPENAI_LOCATION)
+              DALLE_LOCATION: $(DALLE_LOCATION)
+
+  # Application Deployment
+  - deployment: ApplicationDev
+    displayName: 'Deploy Application - Dev'
+    dependsOn: InfrastructureDev
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'azurechat-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download application artifacts'
+            inputs:
+              artifact: $(artifactName)
+              path: '$(Pipeline.Workspace)/$(artifactName)'
+          
+          - task: AzureKeyVault@2
+            displayName: 'Retrieve secrets from Key Vault'
+            inputs:
+              azureSubscription: $(azureServiceConnectionDev)
+              KeyVaultName: '$(KEY_VAULT_NAME_DEV)'
+              SecretsFilter: '*'
+              RunAsPreJob: false
+          
+          - task: AzureWebApp@1
+            displayName: 'Deploy to Azure Web App'
+            inputs:
+              azureSubscription: $(azureServiceConnectionDev)
+              appType: webAppLinux
+              appName: '$(WEBAPP_NAME_DEV)'
+              package: '$(Pipeline.Workspace)/$(artifactName)/$(artifactName)-$(Build.BuildId).zip'
+              runtimeStack: 'NODE|20-lts'
+              startUpCommand: 'npm start'
+              appSettings: |
+                -USE_MANAGED_IDENTITIES true
+                -NEXTAUTH_URL https://$(WEBAPP_NAME_DEV).azurewebsites.net
+                -NEXTAUTH_SECRET $(nextauth-secret)
+                -ADMIN_EMAIL_ADDRESS $(ADMIN_EMAIL_ADDRESS_DEV)
+                -AZURE_COSMOSDB_URI $(cosmos-uri)
+                -AZURE_COSMOSDB_DB_NAME $(COSMOS_DB_NAME)
+                -AZURE_COSMOSDB_CONTAINER_NAME $(COSMOS_CONTAINER_NAME)
+                -AZURE_COSMOSDB_CONFIG_CONTAINER_NAME $(COSMOS_CONFIG_CONTAINER_NAME)
+                -AZURE_OPENAI_API_INSTANCE_NAME $(OPENAI_INSTANCE_NAME_DEV)
+                -AZURE_OPENAI_API_DEPLOYMENT_NAME $(OPENAI_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_API_VERSION $(OPENAI_API_VERSION)
+                -AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME $(OPENAI_EMBEDDINGS_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_DALLE_API_INSTANCE_NAME $(OPENAI_DALLE_INSTANCE_NAME_DEV)
+                -AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME $(OPENAI_DALLE_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_DALLE_API_VERSION $(OPENAI_DALLE_API_VERSION)
+                -AZURE_SEARCH_NAME $(SEARCH_SERVICE_NAME_DEV)
+                -AZURE_SEARCH_INDEX_NAME $(SEARCH_INDEX_NAME)
+                -AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT $(DOCUMENT_INTELLIGENCE_ENDPOINT_DEV)
+                -AZURE_SPEECH_REGION $(SPEECH_REGION)
+                -AZURE_STORAGE_ACCOUNT_NAME $(STORAGE_ACCOUNT_NAME_DEV)
+                -AZURE_KEY_VAULT_NAME $(KEY_VAULT_NAME_DEV)
+                -DEBUG false
+          
+          # Health check and smoke tests
+          - task: PowerShell@2
+            displayName: 'Application health check'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $uri = "https://$(WEBAPP_NAME_DEV).azurewebsites.net"
+                Write-Host "Performing health check on: $uri"
+                
+                for ($i = 1; $i -le 5; $i++) {
+                    try {
+                        $response = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30
+                        if ($response.StatusCode -eq 200) {
+                            Write-Host "✅ Health check passed (attempt $i)"
+                            exit 0
+                        }
+                    }
+                    catch {
+                        Write-Host "⚠️ Health check failed (attempt $i): $($_.Exception.Message)"
+                        if ($i -eq 5) { exit 1 }
+                        Start-Sleep -Seconds 30
+                    }
+                }
+
+# ==================================================
+# PRODUCTION DEPLOYMENT STAGE
+# ==================================================
+- stage: DeployProd
+  displayName: 'Deploy to Production'
+  dependsOn: DeployDev
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  variables:
+    - group: 'azurechat-prod'  # Create this variable group for prod environment
+    - name: environmentName
+      value: 'prod'
+    - name: resourceGroupName
+      value: 'rg-azurechat-prod'
+  jobs:
+  
+  # Manual approval gate (configured in Azure DevOps environment)
+  - deployment: ProductionApproval
+    displayName: 'Production Deployment Approval'
+    pool: server
+    environment: 'azurechat-prod'  # Configure manual approval in this environment
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: echo "Production deployment approved"
+  
+  # Infrastructure Deployment
+  - deployment: InfrastructureProd
+    displayName: 'Deploy Infrastructure - Prod'
+    dependsOn: ProductionApproval
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'azurechat-prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download infrastructure artifacts'
+            inputs:
+              artifact: infrastructure
+              path: '$(Pipeline.Workspace)/infrastructure'
+          
+          - task: AzureCLI@2
+            displayName: 'Deploy Azure infrastructure'
+            inputs:
+              azureSubscription: $(azureServiceConnectionProd)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Deploying infrastructure to Production environment..."
+                
+                # Set variables
+                DEPLOYMENT_NAME="azurechat-infra-$(Build.BuildId)"
+                
+                # Deploy main bicep template with production settings
+                az deployment sub create \
+                  --name "$DEPLOYMENT_NAME" \
+                  --location "$(AZURE_LOCATION)" \
+                  --template-file "$(Pipeline.Workspace)/infrastructure/main.bicep" \
+                  --parameters \
+                    name="$(ENVIRONMENT_NAME)" \
+                    location="$(AZURE_LOCATION)" \
+                    openAILocation="$(OPENAI_LOCATION)" \
+                    dalleLocation="$(DALLE_LOCATION)" \
+                    disableLocalAuth=true \
+                    usePrivateEndpoints=$(USE_PRIVATE_ENDPOINTS) \
+                    resourceGroupName="$RESOURCE_GROUP_NAME" \
+                    searchServiceSkuName="standard2" \
+                    openAISku="S0"
+                
+                # Capture outputs
+                echo "Capturing deployment outputs..."
+                az deployment sub show \
+                  --name "$DEPLOYMENT_NAME" \
+                  --query "properties.outputs" \
+                  --output json > deployment-outputs.json
+                
+                cat deployment-outputs.json
+            env:
+              ENVIRONMENT_NAME: $(environmentName)
+              RESOURCE_GROUP_NAME: $(resourceGroupName)
+              AZURE_LOCATION: $(AZURE_LOCATION)
+              OPENAI_LOCATION: $(OPENAI_LOCATION)
+              DALLE_LOCATION: $(DALLE_LOCATION)
+              USE_PRIVATE_ENDPOINTS: $(USE_PRIVATE_ENDPOINTS)
+
+  # Application Deployment with Blue-Green strategy
+  - deployment: ApplicationProd
+    displayName: 'Deploy Application - Prod'
+    dependsOn: InfrastructureProd
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'azurechat-prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download application artifacts'
+            inputs:
+              artifact: $(artifactName)
+              path: '$(Pipeline.Workspace)/$(artifactName)'
+          
+          - task: AzureKeyVault@2
+            displayName: 'Retrieve secrets from Key Vault'
+            inputs:
+              azureSubscription: $(azureServiceConnectionProd)
+              KeyVaultName: '$(KEY_VAULT_NAME_PROD)'
+              SecretsFilter: '*'
+              RunAsPreJob: false
+          
+          # Deploy to staging slot first
+          - task: AzureWebApp@1
+            displayName: 'Deploy to staging slot'
+            inputs:
+              azureSubscription: $(azureServiceConnectionProd)
+              appType: webAppLinux
+              appName: '$(WEBAPP_NAME_PROD)'
+              package: '$(Pipeline.Workspace)/$(artifactName)/$(artifactName)-$(Build.BuildId).zip'
+              runtimeStack: 'NODE|20-lts'
+              startUpCommand: 'npm start'
+              deployToSlotOrASE: true
+              slotName: 'staging'
+              appSettings: |
+                -USE_MANAGED_IDENTITIES true
+                -NEXTAUTH_URL https://$(WEBAPP_NAME_PROD)-staging.azurewebsites.net
+                -NEXTAUTH_SECRET $(nextauth-secret)
+                -ADMIN_EMAIL_ADDRESS $(ADMIN_EMAIL_ADDRESS_PROD)
+                -AZURE_COSMOSDB_URI $(cosmos-uri)
+                -AZURE_COSMOSDB_DB_NAME $(COSMOS_DB_NAME)
+                -AZURE_COSMOSDB_CONTAINER_NAME $(COSMOS_CONTAINER_NAME)
+                -AZURE_COSMOSDB_CONFIG_CONTAINER_NAME $(COSMOS_CONFIG_CONTAINER_NAME)
+                -AZURE_OPENAI_API_INSTANCE_NAME $(OPENAI_INSTANCE_NAME_PROD)
+                -AZURE_OPENAI_API_DEPLOYMENT_NAME $(OPENAI_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_API_VERSION $(OPENAI_API_VERSION)
+                -AZURE_OPENAI_API_EMBEDDINGS_DEPLOYMENT_NAME $(OPENAI_EMBEDDINGS_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_DALLE_API_INSTANCE_NAME $(OPENAI_DALLE_INSTANCE_NAME_PROD)
+                -AZURE_OPENAI_DALLE_API_DEPLOYMENT_NAME $(OPENAI_DALLE_DEPLOYMENT_NAME)
+                -AZURE_OPENAI_DALLE_API_VERSION $(OPENAI_DALLE_API_VERSION)
+                -AZURE_SEARCH_NAME $(SEARCH_SERVICE_NAME_PROD)
+                -AZURE_SEARCH_INDEX_NAME $(SEARCH_INDEX_NAME)
+                -AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT $(DOCUMENT_INTELLIGENCE_ENDPOINT_PROD)
+                -AZURE_SPEECH_REGION $(SPEECH_REGION)
+                -AZURE_STORAGE_ACCOUNT_NAME $(STORAGE_ACCOUNT_NAME_PROD)
+                -AZURE_KEY_VAULT_NAME $(KEY_VAULT_NAME_PROD)
+                -DEBUG false
+          
+          # Staging validation
+          - task: PowerShell@2
+            displayName: 'Validate staging deployment'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $uri = "https://$(WEBAPP_NAME_PROD)-staging.azurewebsites.net"
+                Write-Host "Validating staging deployment: $uri"
+                
+                for ($i = 1; $i -le 10; $i++) {
+                    try {
+                        $response = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30
+                        if ($response.StatusCode -eq 200) {
+                            Write-Host "✅ Staging validation passed (attempt $i)"
+                            break
+                        }
+                    }
+                    catch {
+                        Write-Host "⚠️ Staging validation failed (attempt $i): $($_.Exception.Message)"
+                        if ($i -eq 10) { 
+                            Write-Error "Staging validation failed after 10 attempts"
+                            exit 1 
+                        }
+                        Start-Sleep -Seconds 30
+                    }
+                }
+          
+          # Swap staging to production using Azure CLI
+          - task: AzureCLI@2
+            displayName: 'Swap staging to production'
+            inputs:
+              azureSubscription: $(azureServiceConnectionProd)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Swapping staging slot to production..."
+                az webapp deployment slot swap \
+                  --resource-group "$(resourceGroupName)" \
+                  --name "$(WEBAPP_NAME_PROD)" \
+                  --slot "staging" \
+                  --target-slot "production"
+                echo "Slot swap completed successfully"
+          
+          # Production health check
+          - task: PowerShell@2
+            displayName: 'Production health check'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $uri = "https://$(WEBAPP_NAME_PROD).azurewebsites.net"
+                Write-Host "Performing production health check: $uri"
+                
+                for ($i = 1; $i -le 10; $i++) {
+                    try {
+                        $response = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30
+                        if ($response.StatusCode -eq 200) {
+                            Write-Host "✅ Production health check passed (attempt $i)"
+                            Write-Host "🚀 Production deployment completed successfully!"
+                            exit 0
+                        }
+                    }
+                    catch {
+                        Write-Host "⚠️ Production health check failed (attempt $i): $($_.Exception.Message)"
+                        if ($i -eq 10) {
+                            Write-Error "Production health check failed - consider rollback"
+                            exit 1
+                        }
+                        Start-Sleep -Seconds 30
+                    }
+                }
+
+# ==================================================
+# POST-DEPLOYMENT MONITORING
+# ==================================================
+- stage: PostDeploymentValidation
+  displayName: 'Post-Deployment Validation'
+  dependsOn: DeployProd
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: MonitoringSetup
+    displayName: 'Setup Monitoring and Alerts'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: PowerShell@2
+      displayName: 'Deployment notification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "🎉 Azure Chat deployment completed successfully!"
+          Write-Host "📊 Production URL: https://$(WEBAPP_NAME_PROD).azurewebsites.net"
+          Write-Host "📈 Monitor application performance and usage"
+          Write-Host "🔐 Verify all security configurations are in place"
+          Write-Host "📚 Update runbooks and documentation as needed"
